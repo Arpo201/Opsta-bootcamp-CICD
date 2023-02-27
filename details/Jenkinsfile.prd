@@ -1,0 +1,71 @@
+def scmVars
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: helm
+    image: lachlanevenson/k8s-helm:v3.5.0
+    command:
+    - cat
+    tty: true
+"""
+    }
+  }
+
+  // Define Environment Variables
+  environment {
+    // Use Google Service Account IAM for Kubernetes Authentication
+    GOOGLE_APPLICATION_CREDENTIALS = credentials('gke-service-account-key')
+  }
+
+  // Git Parameter Choices
+  parameters {
+    gitParameter name: 'TAG',
+                 selectedValue: 'TOP',
+                 sortMode: 'DESCENDING_SMART',
+                 tagFilter: 'build-*',
+                 type: 'PT_TAG'
+  }
+
+  stages {
+
+    // ***** Stage Clone *****
+    stage('Clone details source code') {
+      steps {
+        script {
+          scmVars = checkout([
+            $class: 'GitSCM',
+            branches: [[name: "refs/tags/${params.TAG}"]],
+            userRemoteConfigs: [[
+              credentialsId: 'bookinfo-git-deploy-key',
+              url: 'git@gitlab.com:devsecops-workshop1/bookinfo/details.git'
+            ]]
+          ])
+        }
+      }
+    }
+
+    // ***** Stage Deploy *****
+    stage('Deploy details with Helm Chart') {
+      steps {
+        container('helm') {
+          script {
+            withKubeConfig([credentialsId: 'gke-kubeconfig']) {
+              // Helm upgrade with set production tag
+              sh "cat k8s/helm-values/values-bookinfo-prd-details.yaml"
+              sh "helm upgrade --install -f k8s/helm-values/values-bookinfo-prd-details.yaml --wait \
+                --set extraEnv.COMMIT_ID=${scmVars.GIT_COMMIT} \
+                --set details.tag=${params.TAG} \
+                --namespace bookinfo-prd bookinfo-prd-details k8s/helm"
+            }
+          }
+        }
+      }
+    }
+  }
+}

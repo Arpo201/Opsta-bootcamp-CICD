@@ -1,0 +1,283 @@
+// Define variables
+def scmVars
+
+// Start Pipeline
+pipeline {
+
+  // Configure Jenkins Slave
+  agent {
+    // Use Kubernetes as dynamic Jenkins Slave
+    kubernetes {
+      // Kubernetes Manifest File to spin up Pod to do build
+      yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:20.10.3-dind
+    command:
+    - dockerd
+    - --host=unix:///var/run/docker.sock
+    - --host=tcp://0.0.0.0:2375
+    - --storage-driver=overlay2
+    tty: true
+    securityContext:
+      privileged: true
+  - name: helm
+    image: lachlanevenson/k8s-helm:v3.5.0
+    command:
+    - cat
+    tty: true
+  - name: skan
+    image: alcide/skan:v0.9.0-debug
+    command:
+    - cat
+    tty: true
+  - name: java-node
+    image: timbru31/java-node:11-alpine-jre-14
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /home/jenkins/dependency-check-data
+      name: dependency-check-data
+  - name: trivy
+    image: aquasec/trivy
+    command:
+    - cat
+    tty: true
+  - name: python
+    image: python:3.10-alpine
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: dependency-check-data
+    hostPath:
+      path: /tmp/dependency-check-data
+"""
+    } // End kubernetes
+  } // End agent
+
+  // Define Environment Variables
+  environment {
+    ENV_NAME = "${BRANCH_NAME == "master" ? "uat" : "${BRANCH_NAME}"}"
+    SCANNER_HOME = tool 'sonarqube-scanner'
+    PROJECT_KEY = "bookinfo-ratings"
+    PROJECT_NAME = "bookinfo-ratings"
+
+    // Use Google Service Account IAM for Kubernetes Authentication
+    GOOGLE_APPLICATION_CREDENTIALS = credentials('gke-service-account-key')
+  }
+
+  // Start Pipeline
+  stages {
+
+    // ***** Stage Clone *****
+    stage('Clone ratings source code') {
+      // Steps to run build
+      steps {
+        // Run in Jenkins Slave container
+        container('jnlp') {
+          // Use script to run
+          script {
+            // Git clone repo and checkout branch as we put in parameter
+            scmVars = git branch: "${BRANCH_NAME}",
+                          credentialsId: 'bookinfo-git-deploy-key',
+                          url: 'git@gitlab.com:devsecops-workshop1/bookinfo/ratings.git'
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // ***** Stage Sonarqube *****
+    stage('Sonarqube Scanner') {
+      // when { equals expected: true, actual: false }
+      steps {
+        container('java-node') {
+          script {
+            // Authentication with https://sonarqube.arpo.ml
+            withSonarQubeEnv('sonarqube') {
+              // Run Sonar Scanner
+              sh '''${SCANNER_HOME}/bin/sonar-scanner \
+              -D sonar.projectKey=${PROJECT_KEY} \
+              -D sonar.projectName=${PROJECT_NAME} \
+              -D sonar.projectVersion=${BRANCH_NAME}-${BUILD_NUMBER} \
+              -D sonar.source=./src
+              '''
+            } // End withSonarQubeEnv
+            // Delay 10 second between withSonarQubeEnv and waitForQualityGate
+            sleep(10)
+            // Run Quality Gate
+            timeout(time: 3, unit: 'MINUTES') {
+              def qg = waitForQualityGate()
+              if (qg.status != 'OK') {
+                error "Pipeline aborted due to quality gate failure: ${qg.status}"
+              }
+            } // End timeout
+          
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // ***** Stage OWASP *****
+    stage('OWASP Dependency check') {
+      // when { equals expected: true, actual: false }
+      steps {
+        container('java-node') {
+          script {
+            sh "mkdir reports"
+            //Install application dependency
+            sh '''cd src/ && npm install --package-lock && cd ../'''
+
+            // Start OWASP dependency check
+            dependencyCheck(
+              additionalArguments: "--data /home/jenkins/dependency-check-data --out reports/dependency-check-report.xml",
+              odcInstallation: "dependency-check"
+            )
+            archiveArtifacts artifacts: 'reports/dependency-check-report.xml'
+            // Publish report to Jenkins
+            dependencyCheckPublisher(
+              pattern: 'reports/dependency-check-report.xml'
+            ) 
+
+            // Remove application dependency
+            sh '''rm -rf src/node_modules src/package-lock.json'''
+
+          } // End Script
+        } // End Container
+      } // End Steps
+    } // End stage
+
+    // ***** Stage sKan *****
+    stage('sKan') {
+      steps {
+        container('helm') {
+          script {
+            // Generate k8s-manifest-deploy.yaml for scannong
+            sh "helm template -f k8s/helm-values/values-bookinfo-${ENV_NAME}-ratings.yaml \
+                --set extraEnv.COMMIT_ID=${scmVars.GIT_COMMIT} \
+                --namespace bookinfo-${ENV_NAME} bookinfo-${ENV_NAME}-ratings k8s/helm \
+                > k8s-manifest-deploy.yaml"
+          } // End script
+        } // End container
+        container('skan') {
+          script {
+            // Scanning with sKan
+            sh "/skan manifest -f k8s-manifest-deploy.yaml"
+            // Keep report as artifacts
+            archiveArtifacts artifacts: 'skan-result.html'
+            sh "rm k8s-manifest-deploy.yaml"
+            sh "mv skan-result.html reports"
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // ***** Stage Build *****
+    stage('Build ratings Docker Image and push') {
+      steps {
+        container('docker') {
+          script {
+            // Do docker login authentication
+            docker.withRegistry('https://registry.arpo.ml', 'registry-bookinfo') {
+              // Do docker build and docker push
+              docker.build("registry.arpo.ml/bookinfo/ratings:${ENV_NAME}").push()
+            } // End docker.withRegistry
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // ***** Stage scan container image *****
+    stage('Scan image with trivy') {
+      steps {
+        container('trivy') {
+          script {
+            withCredentials([usernamePassword(credentialsId: 'registry-bookinfo', passwordVariable: 'TRIVY_PASSWORD', usernameVariable: 'TRIVY_USERNAME')]) {
+              sh "trivy image -f json -o reports/trivy-results.json registry.arpo.ml/bookinfo/ratings:${ENV_NAME}"
+              recordIssues(tools: [trivy(pattern: 'reports/trivy-results.json')])
+              archiveArtifacts artifacts: 'reports/trivy-results.json'
+            } // End withCredentials
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // // ***** Stage Anchore *****
+    // stage('Anchore Engine') {
+    //   // when { equals expected: true, actual: false }
+    //   steps {
+    //     container('jnlp') {
+    //       script {
+    //         //Send Docker Images to Anchore Analyzer
+    //         writeFile file: 'anchore_images', text: "registry.arpo.ml/bookinfo/ratings:${ENV_NAME}"
+    //         anchore name: 'anchore_images', bailOnFail: false
+    //       }// End script
+    //     }// End container
+    //   }// End steps
+    // }// End stage
+
+    // ***** Stage Deploy *****
+    stage('Deploy ratings with Helm Chart') {
+      // when { equals expected: true, actual: false }
+      steps {
+        // Run on Helm container
+        container('helm') {
+          script {
+            // Use kubeconfig from Jenkins Credential
+            withKubeConfig([credentialsId: 'gke-kubeconfig']) {
+              // Run Helm upgrade
+              sh "helm upgrade --install -f k8s/helm-values/values-bookinfo-${ENV_NAME}-ratings.yaml --wait \
+                --set extraEnv.COMMIT_ID=${scmVars.GIT_COMMIT} \
+                --namespace bookinfo-${ENV_NAME} bookinfo-${ENV_NAME}-ratings k8s/helm"
+            } // End withKubeConfig
+          } // End script
+        } // End container
+      } // End steps
+    } // End stage
+
+    // ***** Stage up report to archerysec *****
+    stage('Upload reports from scanning to archerysec') {
+      // when { equals expected: true, actual: false }
+      // Steps to run build
+      steps {
+        // Run in Jenkins Slave container
+        container('python') {
+          // Use script to run
+          script {
+            sh "pip install archerysec-cli"
+
+            withCredentials([string(credentialsId: 'archerysec-project-id', variable: 'ARCHERYSEC_PROJECT_ID'), string(credentialsId: 'archerysec-token', variable: 'ARCHERYSEC_TOKEN')]) {
+              // Up dependency-check-report.xml
+              sh """archerysec-cli \
+              -h https://archerysec.arpo.ml \
+              -t ${ARCHERYSEC_TOKEN} \
+              -p reports/dependency-check-report.xml \
+              --file-type=XML \
+              --target=dependencycheck-bookinfo-${ENV_NAME}-ratings \
+              --scanner=dependencycheck \
+              --project=${ARCHERYSEC_PROJECT_ID} \
+              --upload"""
+
+              // Up trivy-results.json
+              sh """archerysec-cli \
+              -h https://archerysec.arpo.ml \
+              -t ${ARCHERYSEC_TOKEN} \
+              -p reports/trivy-results.json \
+              --file-type=XML \
+              --target=trivy-bookinfo-${ENV_NAME}-ratings \
+              --scanner=trivy \
+              --project=${ARCHERYSEC_PROJECT_ID} \
+              --upload"""
+
+            } // End script
+          } // End container
+        } // End steps
+      } // End stage
+    } // End stage
+
+  } // End stages
+} // End pipeline

@@ -1,0 +1,24 @@
+ratings:
+  namespace: bookinfo-prd
+  image: registry.arpo.ml/bookinfo/ratings
+  tag: prd
+  replicas: 1
+  imagePullSecrets: registry-bookinfo
+  port: 8080
+  healthCheckPath: "/health"
+  mongodbPasswordExistingSecret: bookinfo-prd-ratings-mongodb-secret
+ingress:
+  host: arpo.ml
+  path: "/ratings(/|$)(.*)"
+  serviceType: ClusterIP
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    cert-manager.io/cluster-issuer: "letsencrypt"
+  tlsSecretName: letsencrypt-prd
+extraEnv:
+  SERVICE_VERSION: v2
+  MONGO_DB_URL: mongodb://bookinfo-prd-ratings-mongodb:27017/?authSource=ratings
+  MONGO_DB_NAME: ratings
+  MONGO_DB_USERNAME: ratings-prd
+  COMMIT_ID: CHANGEME

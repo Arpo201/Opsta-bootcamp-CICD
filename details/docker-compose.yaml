@@ -1,0 +1,7 @@
+version: "3"
+services:
+  details:
+    build: .
+    image: registry.arpo.ml/bookinfo/details:dev
+    ports:
+      - "9080:9080"

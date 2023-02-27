@@ -1,0 +1,8 @@
+id_rsa
+.scannerwork/
+reports/
+result/
+.gradle/
+build/
+lib/
+dependency-check-report.html
